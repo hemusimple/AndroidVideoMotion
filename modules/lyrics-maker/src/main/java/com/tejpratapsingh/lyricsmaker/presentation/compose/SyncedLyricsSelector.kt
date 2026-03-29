@@ -85,64 +85,41 @@ private sealed interface ListItem {
     data object EndHandle : ListItem
 }
 
-// ─── Auto-scroll state ────────────────────────────────────────────────────────
+// ─── Auto-scroll state ─────────────────────────────────────────────────────────────
 
-/**
- * Shared mutable state that coordinates auto-scrolling between the drag handles
- * and the [LazyColumn].
- *
- * Each handle reports its pointer Y in root (screen) coordinates while a drag
- * is in progress. A [LaunchedEffect] in [SyncedLyricsSelector] wakes up whenever
- * [isDragging] becomes true, then ticks at ~60 fps and calls [scrollDeltaForTick]
- * to decide how far and in which direction to scroll.
- *
- * Edge zone: the top and bottom [edgeFraction] of the list height trigger
- * scrolling. Scroll speed ramps linearly from 0 at the zone boundary to
- * [maxScrollPxPerTick] at the very edge.
- */
-private class AutoScrollState {
-    var isDragging by mutableStateOf(false)
-    var pointerYInRoot by mutableFloatStateOf(0f)
-    var listTopInRoot by mutableFloatStateOf(0f)
-    var listBottomInRoot by mutableFloatStateOf(0f)
+class AutoScrollState {
+    var isDragging: Boolean by mutableStateOf(false)
+    private var zoneY: Float = 0f
+    private var listHeightPx: Float = 0f
 
-    val edgeFraction = 0.10f
-    val maxScrollPxPerTick = 18f
+    fun update(
+        y: Float,
+        listTop: Float,
+        listBottom: Float,
+    ) {
+        zoneY = y
+        listHeightPx = listBottom - listTop
+    }
 
     fun scrollDeltaForTick(): Float {
-        if (!isDragging) return 0f
-        val listHeight = listBottomInRoot - listTopInRoot
-        if (listHeight <= 0f) return 0f
-        val edgeZone = listHeight * edgeFraction
-        val distFromTop = pointerYInRoot - listTopInRoot
-        val distFromBottom = listBottomInRoot - pointerYInRoot
+        val zone = listHeightPx * 0.15f
         return when {
-            distFromTop in 0f..edgeZone -> {
-                -maxScrollPxPerTick * (1f - distFromTop / edgeZone)
-            }
-
-            distFromBottom in 0f..edgeZone -> {
-                maxScrollPxPerTick * (1f - distFromBottom / edgeZone)
-            }
-
-            else -> {
-                0f
-            }
+            zoneY < zone -> -12f
+            zoneY > listHeightPx - zone -> 12f
+            else -> 0f
         }
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Private helpers ─────────────────────────────────────────────────────────────
 
 private fun initialEndIndex(
     lyrics: List<SyncedLyricFrame>,
     fps: Int,
-    targetSeconds: Int = 60,
 ): Int {
-    if (lyrics.isEmpty()) return 0
-    val targetFrames = targetSeconds * fps
-    val idx = lyrics.indexOfLast { it.frame <= targetFrames }
-    return if (idx < 0) 0 else idx
+    val targetFrames = fps * 60
+    val idx = lyrics.indexOfFirst { it.frame >= targetFrames }
+    return if (idx == -1) lyrics.lastIndex else idx
 }
 
 /** Pixel-drag offset → list-item-index delta using average visible item height. */
@@ -210,12 +187,12 @@ fun SyncedLyricsSelector(
     }
     val liveEndIndex by remember {
         derivedStateOf {
-            val endDelta = computeDeltaItems(listState, endDragOffsetY)
-            if (moveMode && startDragOffsetY != 0f) {
-                // End tracks start exactly in move mode
+            if (moveMode) {
+                // End tracks start exactly in move mode — use the same startDragOffsetY
                 val rangeSize = endLyricIndex - startLyricIndex
                 liveStartIndex + rangeSize
             } else {
+                val endDelta = computeDeltaItems(listState, endDragOffsetY)
                 (endLyricIndex + endDelta).coerceIn(liveStartIndex, viewModel.lyrics.lastIndex)
             }
         }
@@ -262,332 +239,5 @@ fun SyncedLyricsSelector(
             if (delta != 0f) listState.scrollBy(delta)
             delay(16L)
         }
-    }
-
-    Column(modifier = modifier.fillMaxSize()) {
-        // ── Summary bar ───────────────────────────────────────────────────────
-        if (viewModel.lyrics.isNotEmpty()) {
-            Surface(tonalElevation = 2.dp) {
-                Row(
-                    modifier =
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column {
-                        Text(
-                            "${selected.size} line(s)  ·  $selectedDurationLabel",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            "selected",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Row {
-                        TextButton(onClick = { onFinalize(selected) }) { Text("Finalize") }
-                        TextButton(onClick = {
-                            startLyricIndex = 0
-                            endLyricIndex = initialEndIndex(viewModel.lyrics, fps)
-                            startDragOffsetY = 0f
-                            endDragOffsetY = 0f
-                            moveMode = false
-                        }) { Text("Reset") }
-                    }
-                }
-            }
-            HorizontalDivider()
-            onSelectionChanged(selected)
-        }
-
-        if (viewModel.lyrics.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                Text("No Lyrics Selected", modifier = Modifier.align(Alignment.Center))
-            }
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier =
-                    Modifier
-                        .fillMaxSize()
-                        .onGloballyPositioned { coords ->
-                            val topLeft = coords.positionInRoot()
-                            autoScroll.listTopInRoot = topLeft.y
-                            autoScroll.listBottomInRoot = topLeft.y + coords.size.height
-                        },
-                contentPadding = PaddingValues(vertical = 8.dp),
-            ) {
-                itemsIndexed(
-                    displayItems,
-                    key = { _, item ->
-                        when (item) {
-                            is ListItem.LyricItem -> "lyric_${item.index}"
-                            ListItem.StartHandle -> "handle_start"
-                            ListItem.EndHandle -> "handle_end"
-                        }
-                    },
-                ) { _, item ->
-                    when (item) {
-                        is ListItem.StartHandle -> {
-                            StartDragHandle(
-                                color = MaterialTheme.colorScheme.primary,
-                                listState = listState,
-                                autoScroll = autoScroll,
-                                moveMode = moveMode,
-                                onMoveModeToggle = { moveMode = !moveMode },
-                                onDrag = { dy -> startDragOffsetY += dy },
-                                onDragEnd = {
-                                    // Commit live index, reset offset
-                                    startLyricIndex = liveStartIndex
-                                    endLyricIndex = liveEndIndex // also commit end in move mode
-                                    startDragOffsetY = 0f
-                                },
-                                onDragCancel = { startDragOffsetY = 0f },
-                            )
-                        }
-
-                        is ListItem.EndHandle -> {
-                            DragHandle(
-                                label = "END",
-                                color = MaterialTheme.colorScheme.tertiary,
-                                listState = listState,
-                                autoScroll = autoScroll,
-                                onDrag = { dy -> endDragOffsetY += dy },
-                                onDragEnd = {
-                                    endLyricIndex = liveEndIndex
-                                    endDragOffsetY = 0f
-                                },
-                                onDragCancel = { endDragOffsetY = 0f },
-                            )
-                        }
-
-                        is ListItem.LyricItem -> {
-                            LyricRow(
-                                line = item.frame,
-                                isSelected = selection.contains(item.index),
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ─── Handle composables ───────────────────────────────────────────────────────
-
-/**
- * Start handle with move-mode toggle.
- *
- * Callbacks are intentionally thin — the parent owns all index arithmetic:
- * - [onDrag]      called every frame with the raw Y pixel delta
- * - [onDragEnd]   called on finger-up; parent commits and resets offset
- * - [onDragCancel] called on gesture cancel; parent resets offset to roll back
- */
-@Composable
-private fun StartDragHandle(
-    color: Color,
-    listState: LazyListState,
-    autoScroll: AutoScrollState,
-    moveMode: Boolean,
-    onMoveModeToggle: () -> Unit,
-    onDrag: (dy: Float) -> Unit,
-    onDragEnd: () -> Unit,
-    onDragCancel: () -> Unit,
-) {
-    var dragOffsetY by remember { mutableFloatStateOf(0f) }
-    var isDragging by remember { mutableStateOf(false) }
-    var selfTopInRoot by remember { mutableFloatStateOf(0f) }
-
-    val bgAlpha =
-        when {
-            isDragging && moveMode -> 0.35f
-            isDragging -> 0.25f
-            moveMode -> 0.20f
-            else -> 0.12f
-        }
-
-    Row(
-        modifier =
-            Modifier
-                .zIndex(if (isDragging) 1f else 0f)
-                .offset { IntOffset(0, dragOffsetY.roundToInt()) }
-                .fillMaxWidth()
-                .onGloballyPositioned { selfTopInRoot = it.positionInRoot().y }
-                .background(color.copy(alpha = bgAlpha))
-                .padding(start = 4.dp, end = 12.dp, top = 4.dp, bottom = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        IconButton(
-            onClick = onMoveModeToggle,
-            colors = IconButtonDefaults.iconButtonColors(contentColor = color),
-        ) {
-            Icon(
-                imageVector = if (moveMode) Icons.Default.OpenWith else Icons.Default.LockOpen,
-                contentDescription =
-                    if (moveMode) {
-                        "Move range (tap to resize only)"
-                    } else {
-                        "Resize start (tap to move whole range)"
-                    },
-                modifier = Modifier.size(18.dp),
-            )
-        }
-
-        Row(
-            modifier =
-                Modifier
-                    .weight(1f)
-                    .pointerInput(Unit) {
-                        detectDragGestures(
-                            onDragStart = { localOffset ->
-                                isDragging = true
-                                autoScroll.isDragging = true
-                                autoScroll.pointerYInRoot = selfTopInRoot + localOffset.y
-                            },
-                            onDrag = { _, dragAmount ->
-                                dragOffsetY += dragAmount.y
-                                autoScroll.pointerYInRoot += dragAmount.y
-                                onDrag(dragAmount.y) // ← live update every frame
-                            },
-                            onDragEnd = {
-                                onDragEnd()
-                                dragOffsetY = 0f
-                                isDragging = false
-                                autoScroll.isDragging = false
-                            },
-                            onDragCancel = {
-                                onDragCancel()
-                                dragOffsetY = 0f
-                                isDragging = false
-                                autoScroll.isDragging = false
-                            },
-                        )
-                    }.padding(vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Icon(Icons.Default.DragHandle, null, tint = color, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = if (moveMode) "START  ·  drag moves range" else "START",
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.Bold,
-                color = color,
-            )
-            Spacer(Modifier.width(6.dp))
-            Icon(Icons.Default.DragHandle, null, tint = color, modifier = Modifier.size(18.dp))
-        }
-    }
-}
-
-/**
- * Generic draggable separator (END handle).
- * Same thin-callback design as [StartDragHandle].
- */
-@Composable
-private fun DragHandle(
-    label: String,
-    color: Color,
-    listState: LazyListState,
-    autoScroll: AutoScrollState,
-    onDrag: (dy: Float) -> Unit,
-    onDragEnd: () -> Unit,
-    onDragCancel: () -> Unit,
-) {
-    var dragOffsetY by remember { mutableFloatStateOf(0f) }
-    var isDragging by remember { mutableStateOf(false) }
-    var selfTopInRoot by remember { mutableFloatStateOf(0f) }
-
-    Box(
-        modifier =
-            Modifier
-                .zIndex(if (isDragging) 1f else 0f)
-                .offset { IntOffset(0, dragOffsetY.roundToInt()) }
-                .fillMaxWidth()
-                .onGloballyPositioned { selfTopInRoot = it.positionInRoot().y }
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { localOffset ->
-                            isDragging = true
-                            autoScroll.isDragging = true
-                            autoScroll.pointerYInRoot = selfTopInRoot + localOffset.y
-                        },
-                        onDrag = { _, dragAmount ->
-                            dragOffsetY += dragAmount.y
-                            autoScroll.pointerYInRoot += dragAmount.y
-                            onDrag(dragAmount.y) // ← live update every frame
-                        },
-                        onDragEnd = {
-                            onDragEnd()
-                            dragOffsetY = 0f
-                            isDragging = false
-                            autoScroll.isDragging = false
-                        },
-                        onDragCancel = {
-                            onDragCancel()
-                            dragOffsetY = 0f
-                            isDragging = false
-                            autoScroll.isDragging = false
-                        },
-                    )
-                }.background(color.copy(alpha = if (isDragging) 0.25f else 0.12f))
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Icon(Icons.Default.DragHandle, "Drag $label handle", tint = color, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = color)
-            Spacer(Modifier.width(6.dp))
-            Icon(Icons.Default.DragHandle, null, tint = color, modifier = Modifier.size(18.dp))
-        }
-    }
-}
-
-// ─── Lyric row ────────────────────────────────────────────────────────────────
-
-@Composable
-private fun LyricRow(
-    line: SyncedLyricFrame,
-    isSelected: Boolean,
-) {
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 4.dp)
-                .clip(MaterialTheme.shapes.medium)
-                .background(
-                    if (isSelected) {
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
-                    } else {
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                    },
-                ).padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text("[${line.frame}]", style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(64.dp))
-        Spacer(Modifier.width(8.dp))
-        Text(
-            text = line.text.ifEmpty { "…" },
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-            modifier = Modifier.weight(1f),
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            "[${line.frame / provideCurrentConfig().fps} sec]",
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.width(64.dp),
-        )
     }
 }
